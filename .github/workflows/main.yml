@@ -1,0 +1,29 @@
+name: 24/7 Job Search Engine
+
+on:
+  schedule:
+    - cron: '0 */12 * * *' # Runs every 12 hours
+  workflow_dispatch: # Allows you to trigger it manually
+
+jobs:
+  run-search:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Engine
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python main.py
+      - name: Commit and push report
+        run: |
+          git config --global user.name 'Job Engine Bot'
+          git config --global user.email 'bot@example.com'
+          git add job_matches_report.md
+          git commit -m "Update job matches report" || echo "No changes to commit"
+          git push
