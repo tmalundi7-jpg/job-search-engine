@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  job-search-engine:
+    build: .
+    container_name: job_engine_247
+    restart: always # Crucial: This ensures the engine restarts if it crashes or the server reboots!
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data # Maps the local 'data' folder to the container to persist the SQLite DB

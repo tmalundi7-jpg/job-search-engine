@@ -1,11 +1,14 @@
 import sqlite3
 import json
 import logging
+import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-DB_NAME = "jobs_database.db"
+# Ensure data directory exists for Docker persistence
+os.makedirs("data", exist_ok=True)
+DB_NAME = "data/jobs_database.db"
 
 def init_db():
     """Initializes the SQLite database with the required schema."""
@@ -84,7 +87,7 @@ def upsert_jobs(jobs_list):
     conn.close()
     logger.info(f"Database sync: {inserted} new jobs inserted, {updated} existing jobs updated.")
 
-def generate_markdown_report(filepath="job_matches_report.md"):
+def generate_markdown_report(filepath="data/job_matches_report.md"):
     """Reads the active jobs from the database and generates a markdown report."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
