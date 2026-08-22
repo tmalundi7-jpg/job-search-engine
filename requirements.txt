@@ -1,0 +1,8 @@
+crewai
+langchain-groq
+beautifulsoup4
+requests
+schedule
+pydantic
+python-dotenv
+pandas
