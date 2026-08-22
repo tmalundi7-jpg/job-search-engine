@@ -42,7 +42,7 @@ def get_validation_task(validation_agent):
 
 def get_compilation_task(compiler_agent):
     return Task(
-        description="Format the final validated job list into a structured markdown report including a summary and top 20 best matches.",
-        expected_output="A markdown formatted string containing the final report.",
+        description="Take the final validated job list. Return it strictly as a valid JSON array of job objects.",
+        expected_output="A raw JSON string representing an array of job dictionaries.",
         agent=compiler_agent
     )

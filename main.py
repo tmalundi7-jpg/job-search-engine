@@ -15,6 +15,12 @@ tmalundi7@gmail.com | +255797353877
 
 all_agents = get_all_agents()
 
+from database import init_db, upsert_jobs, generate_markdown_report
+import json
+
+# Ensure DB is initialized before starting
+init_db()
+
 def run_engine_cycle():
     logger.info("Starting new continuous job search cycle...")
     
@@ -24,24 +30,44 @@ def run_engine_cycle():
     compiler = all_agents[-1]
 
     search_tasks = get_search_tasks(scraper_agents, cv_text)
-    matching_task = get_matching_task(matcher, cv_text)
-    validation_task = get_validation_task(validator)
-    compilation_task = get_compilation_task(compiler)
+    match_task = get_matching_task(matcher, cv_text)
+    validate_task = get_validation_task(validator)
+    compile_task = get_compilation_task(compiler)
 
     crew = Crew(
         agents=all_agents,
-        tasks=[*search_tasks, matching_task, validation_task, compilation_task],
+        tasks=search_tasks + [match_task, validate_task, compile_task],
         process=Process.sequential,
         verbose=True
     )
 
     result = crew.kickoff()
     
-    # Save Output locally to the engine folder
-    with open("job_matches_report.md", "w", encoding="utf-8") as f:
-        f.write(result)
+    # Try to parse the result as JSON
+    try:
+        raw_output = str(result)
+        # Handle cases where LLM wraps JSON in markdown blocks
+        if "```json" in raw_output:
+            raw_output = raw_output.split("```json")[1].split("```")[0]
+        elif "```" in raw_output:
+            raw_output = raw_output.split("```")[1].split("```")[0]
+            
+        jobs_data = json.loads(raw_output.strip())
         
-    logger.info("Cycle complete. Report saved to job_matches_report.md.")
+        # Save to database
+        if isinstance(jobs_data, list):
+            upsert_jobs(jobs_data)
+        else:
+            logger.error("Parsed JSON is not a list.")
+            
+    except Exception as e:
+        logger.error(f"Failed to parse or insert LLM output. Error: {e}")
+        logger.debug(f"Raw output was: {result}")
+        
+    # Generate the human-readable markdown report from the database
+    generate_markdown_report()
+    
+    logger.info("Cycle completed. Check job_matches_report.md for latest validated matches.")
 
 def start_continuous_loop():
     logger.info("Starting 24/7 Continuous Engine Loop")
