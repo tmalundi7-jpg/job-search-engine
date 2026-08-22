@@ -13,10 +13,11 @@ Part-Qualified Accountant | MSc Accounting & Finance
 tmalundi7@gmail.com | +255797353877
 """
 
+all_agents = get_all_agents()
+
 def run_engine_cycle():
     logger.info("Starting new continuous job search cycle...")
     
-    all_agents = get_all_agents()
     scraper_agents = all_agents[:-3]
     matcher = all_agents[-3]
     validator = all_agents[-2]
