@@ -5,18 +5,20 @@ import json
 import requests
 import asyncio
 from bs4 import BeautifulSoup
-from groq import AsyncGroq
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
 
-api_key = os.getenv("GROQ_API_KEY")
-if not api_key or api_key == "gsk_your_actual_key_here":
-    print("\nCRITICAL ERROR: Your Groq API key is missing or invalid in the .env file!")
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key or api_key == "AIza_your_actual_key_here":
+    print("\nCRITICAL ERROR: Your Google Gemini API key is missing or invalid in the .env file!")
+    print("Please open .env and add: GEMINI_API_KEY=AIza...")
     exit(1)
 
-# ASYNC Groq Client for Swarm processing
-client = AsyncGroq(api_key=api_key)
+# Initialize the state-of-the-art Gemini Client
+client = genai.Client(api_key=api_key)
 
 CV_TEXT = """
 Candidate has ~2 years experience in accounting.
@@ -86,13 +88,17 @@ async def evaluate_job(job):
     "explanation": a short 1-sentence explanation of why it fits.
     """
     try:
-        response = await client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-70b-versatile",
-            temperature=0.1,
-            response_format={"type": "json_object"}
+        # Wrap the sync Gemini API call in asyncio.to_thread to maintain the Async Swarm architecture
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-3.7-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
         )
-        content = response.choices[0].message.content.strip()
+        content = response.text.strip()
         
         if content.startswith("```json"): content = content[7:]
         elif content.startswith("```"): content = content[3:]
@@ -101,18 +107,17 @@ async def evaluate_job(job):
         result = json.loads(content)
         return result.get("score", 0), result.get("explanation", "No explanation")
     except Exception as e:
-        print(f"Groq API Error: {e}")
+        print(f"Gemini API Error: {e}")
         return None, str(e)
 
 async def agent_worker(name, queue, db_conn):
-    """An asynchronous swarm agent that evaluates jobs continuously."""
-    print(f"[{name}] Activated and ready in the swarm.")
+    """An asynchronous swarm agent powered by Gemini 3.7 Flash."""
+    print(f"[{name}] Activated with Gemini brain.")
     c = db_conn.cursor()
     
     while True:
         job = await queue.get()
         
-        # Check DB first to avoid duplicate evaluation
         c.execute("SELECT match_score FROM jobs WHERE link=?", (job['link'],))
         if c.fetchone():
             queue.task_done()
@@ -131,8 +136,8 @@ async def agent_worker(name, queue, db_conn):
             except sqlite3.IntegrityError:
                 pass
                 
-        # Small sleep to prevent API Rate Limiting across the massive swarm
-        await asyncio.sleep(1)
+        # Small sleep to be polite to the Gemini API limits
+        await asyncio.sleep(1.5)
         queue.task_done()
 
 def generate_report(conn):
@@ -155,32 +160,27 @@ async def run_swarm_cycle():
     
     while True:
         jobs = scrape_jobs()
-        print(f"Found {len(jobs)} jobs. Waking up the Agent Swarm to process them concurrently...\n")
+        print(f"Found {len(jobs)} jobs. Waking up the Gemini Agent Swarm to process them concurrently...\n")
         
         queue = asyncio.Queue()
         for job in jobs:
             await queue.put(job)
             
-        # Spawn 10 async agent workers (The Swarm)
-        # 10 is the perfect number: it processes jobs 10x faster than before
-        # but stays well within the 1GB RAM limit and Groq API rate limits.
         workers = []
         for i in range(10):
             w = asyncio.create_task(agent_worker(f"Agent-{i+1}", queue, conn))
             workers.append(w)
             
-        # Wait for queue to be fully processed by the swarm
         await queue.join()
         
-        # Put workers to sleep until next cycle
         for w in workers:
             w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
         
         generate_report(conn)
-        print("Swarm cycle complete! Sleeping for 15 minutes before waking up the swarm again...\n")
+        print("Swarm cycle complete! Sleeping for 15 minutes before checking for new jobs...\n")
         await asyncio.sleep(900)
 
 if __name__ == "__main__":
-    print("Initializing Asynchronous Agent Swarm Architecture...")
+    print("Initializing Asynchronous Gemini Swarm Architecture...")
     asyncio.run(run_swarm_cycle())
