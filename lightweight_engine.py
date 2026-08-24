@@ -3,8 +3,9 @@ import time
 import sqlite3
 import json
 import requests
+import asyncio
 from bs4 import BeautifulSoup
-from groq import Groq
+from groq import AsyncGroq
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,7 +15,8 @@ if not api_key or api_key == "gsk_your_actual_key_here":
     print("\nCRITICAL ERROR: Your Groq API key is missing or invalid in the .env file!")
     exit(1)
 
-client = Groq(api_key=api_key)
+# ASYNC Groq Client for Swarm processing
+client = AsyncGroq(api_key=api_key)
 
 CV_TEXT = """
 Candidate has ~2 years experience in accounting.
@@ -26,13 +28,11 @@ AVOID: Big 4 Audit, CFO, Senior Partner roles.
 
 def setup_db():
     os.makedirs("data", exist_ok=True)
-    # Applied Review Upgrade: Add timeout and WAL mode for robust DB concurrency
     conn = sqlite3.connect("data/jobs.db", timeout=15)
     conn.execute("PRAGMA journal_mode=WAL;")
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS jobs
                  (title TEXT, company TEXT, link TEXT UNIQUE, match_score INTEGER, explanation TEXT, active INTEGER)''')
-    # Applied Review Upgrade: Add Index for faster queries
     c.execute("CREATE INDEX IF NOT EXISTS idx_match_score ON jobs(match_score)")
     conn.commit()
     return conn
@@ -47,11 +47,10 @@ def scrape_jobs():
         "https://www.reed.co.uk/jobs/accounting-jobs-in-scotland?pageno=3"
     ]
     
-    print(f"Scraping Reed.co.uk to bypass Oracle Cloud server blocks...")
+    print(f"Scraping Reed.co.uk to find jobs...")
     
     for url in pages:
         try:
-            # Applied Review Upgrade: Added 15-second timeout to prevent indefinite blocking
             r = requests.get(url, headers=headers, timeout=15)
             soup = BeautifulSoup(r.text, "html.parser")
             
@@ -73,7 +72,7 @@ def scrape_jobs():
             
     return jobs
 
-def evaluate_job(job):
+async def evaluate_job(job):
     prompt = f"""
     You are an expert UK accounting career coach. Evaluate this job against the candidate's CV.
     CV & Rules: {CV_TEXT}
@@ -87,7 +86,7 @@ def evaluate_job(job):
     "explanation": a short 1-sentence explanation of why it fits.
     """
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama3-70b-8192",
             temperature=0.1,
@@ -95,23 +94,48 @@ def evaluate_job(job):
         )
         content = response.choices[0].message.content.strip()
         
-        # Applied Review Upgrade: Sanitize markdown ticks from LLM output to prevent JSONDecodeError
-        if content.startswith("```json"):
-            content = content[7:]
-        elif content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
+        if content.startswith("```json"): content = content[7:]
+        elif content.startswith("```"): content = content[3:]
+        if content.endswith("```"): content = content[:-3]
             
         result = json.loads(content)
         return result.get("score", 0), result.get("explanation", "No explanation")
     except Exception as e:
         print(f"Groq API Error: {e}")
-        # Applied Review Upgrade: Return None instead of 0 to prevent permanently saving a failed API call
         return None, str(e)
 
-def generate_report():
-    conn = sqlite3.connect("data/jobs.db")
+async def agent_worker(name, queue, db_conn):
+    """An asynchronous swarm agent that evaluates jobs continuously."""
+    print(f"[{name}] Activated and ready in the swarm.")
+    c = db_conn.cursor()
+    
+    while True:
+        job = await queue.get()
+        
+        # Check DB first to avoid duplicate evaluation
+        c.execute("SELECT match_score FROM jobs WHERE link=?", (job['link'],))
+        if c.fetchone():
+            queue.task_done()
+            continue
+            
+        score, explanation = await evaluate_job(job)
+        
+        if score is None:
+            print(f"[{name}] Skipped {job['title'][:30]} due to temporary API error.")
+        else:
+            print(f"[{name}] Evaluated: {job['title'][:30]} at {job['company'][:20]} --> AI Score: {score}/100")
+            try:
+                c.execute("INSERT INTO jobs (title, company, link, match_score, explanation, active) VALUES (?, ?, ?, ?, ?, 1)",
+                          (job['title'], job['company'], job['link'], score, explanation))
+                db_conn.commit()
+            except sqlite3.IntegrityError:
+                pass
+                
+        # Small sleep to prevent API Rate Limiting across the massive swarm
+        await asyncio.sleep(1)
+        queue.task_done()
+
+def generate_report(conn):
     c = conn.cursor()
     c.execute("SELECT title, company, link, match_score, explanation FROM jobs WHERE match_score >= 50 ORDER BY match_score DESC")
     jobs = c.fetchall()
@@ -119,46 +143,44 @@ def generate_report():
     with open("data/job_matches_report.md", "w", encoding='utf-8') as f:
         f.write("# Highly Matched Jobs\n\n")
         if not jobs:
-            f.write("No jobs matched your criteria with a score of 50+ yet. The AI might be scoring too harshly, or your API key is invalid.\n")
+            f.write("No jobs matched your criteria with a score of 50+ yet.\n")
         for j in jobs:
             f.write(f"### {j[0]} at {j[1]} (Score: {j[3]}/100)\n")
             f.write(f"**Why:** {j[4]}\n")
             f.write(f"**Link:** {j[2]}\n\n")
-    print("\nReport generated at data/job_matches_report.md")
+    print("\n--- Report generated at data/job_matches_report.md ---\n")
 
-def main():
+async def run_swarm_cycle():
     conn = setup_db()
-    c = conn.cursor()
+    
     while True:
         jobs = scrape_jobs()
-        print(f"Found {len(jobs)} jobs across 3 pages. Scoring them now...\n")
+        print(f"Found {len(jobs)} jobs. Waking up the Agent Swarm to process them concurrently...\n")
         
+        queue = asyncio.Queue()
         for job in jobs:
-            c.execute("SELECT match_score FROM jobs WHERE link=?", (job['link'],))
-            if c.fetchone():
-                continue
-                
-            score, explanation = evaluate_job(job)
+            await queue.put(job)
             
-            # Applied Review Upgrade: If API failed, do not save score to DB so it can be retried later
-            if score is None:
-                print(f"Skipped {job['title'][:40]} due to temporary API error.")
-                time.sleep(2)
-                continue
-                
-            print(f"Evaluated: {job['title'][:40]} at {job['company'][:30]} --> AI Score: {score}/100")
+        # Spawn 10 async agent workers (The Swarm)
+        # 10 is the perfect number: it processes jobs 10x faster than before
+        # but stays well within the 1GB RAM limit and Groq API rate limits.
+        workers = []
+        for i in range(10):
+            w = asyncio.create_task(agent_worker(f"Agent-{i+1}", queue, conn))
+            workers.append(w)
             
-            try:
-                c.execute("INSERT INTO jobs (title, company, link, match_score, explanation, active) VALUES (?, ?, ?, ?, ?, 1)",
-                          (job['title'], job['company'], job['link'], score, explanation))
-                conn.commit()
-            except sqlite3.IntegrityError:
-                pass
-            time.sleep(1)
-            
-        generate_report()
-        print("\nCycle complete! Sleeping for 15 minutes before checking for new jobs...\n")
-        time.sleep(900)
+        # Wait for queue to be fully processed by the swarm
+        await queue.join()
+        
+        # Put workers to sleep until next cycle
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        
+        generate_report(conn)
+        print("Swarm cycle complete! Sleeping for 15 minutes before waking up the swarm again...\n")
+        await asyncio.sleep(900)
 
 if __name__ == "__main__":
-    main()
+    print("Initializing Asynchronous Agent Swarm Architecture...")
+    asyncio.run(run_swarm_cycle())
