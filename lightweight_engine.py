@@ -26,10 +26,14 @@ AVOID: Big 4 Audit, CFO, Senior Partner roles.
 
 def setup_db():
     os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect("data/jobs.db")
+    # Applied Review Upgrade: Add timeout and WAL mode for robust DB concurrency
+    conn = sqlite3.connect("data/jobs.db", timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL;")
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS jobs
                  (title TEXT, company TEXT, link TEXT UNIQUE, match_score INTEGER, explanation TEXT, active INTEGER)''')
+    # Applied Review Upgrade: Add Index for faster queries
+    c.execute("CREATE INDEX IF NOT EXISTS idx_match_score ON jobs(match_score)")
     conn.commit()
     return conn
 
@@ -37,7 +41,6 @@ def scrape_jobs():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     jobs = []
     
-    # Reed is much friendlier to cloud servers than CV-Library
     pages = [
         "https://www.reed.co.uk/jobs/accounting-jobs-in-scotland",
         "https://www.reed.co.uk/jobs/accounting-jobs-in-scotland?pageno=2",
@@ -48,7 +51,8 @@ def scrape_jobs():
     
     for url in pages:
         try:
-            r = requests.get(url, headers=headers)
+            # Applied Review Upgrade: Added 15-second timeout to prevent indefinite blocking
+            r = requests.get(url, headers=headers, timeout=15)
             soup = BeautifulSoup(r.text, "html.parser")
             
             for article in soup.find_all("article"):
@@ -89,11 +93,22 @@ def evaluate_job(job):
             temperature=0.1,
             response_format={"type": "json_object"}
         )
-        result = json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content.strip()
+        
+        # Applied Review Upgrade: Sanitize markdown ticks from LLM output to prevent JSONDecodeError
+        if content.startswith("```json"):
+            content = content[7:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+            
+        result = json.loads(content)
         return result.get("score", 0), result.get("explanation", "No explanation")
     except Exception as e:
         print(f"Groq API Error: {e}")
-        return 0, "Error evaluating"
+        # Applied Review Upgrade: Return None instead of 0 to prevent permanently saving a failed API call
+        return None, str(e)
 
 def generate_report():
     conn = sqlite3.connect("data/jobs.db")
@@ -124,6 +139,13 @@ def main():
                 continue
                 
             score, explanation = evaluate_job(job)
+            
+            # Applied Review Upgrade: If API failed, do not save score to DB so it can be retried later
+            if score is None:
+                print(f"Skipped {job['title'][:40]} due to temporary API error.")
+                time.sleep(2)
+                continue
+                
             print(f"Evaluated: {job['title'][:40]} at {job['company'][:30]} --> AI Score: {score}/100")
             
             try:
