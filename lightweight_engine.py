@@ -34,16 +34,23 @@ def scrape_jobs():
     try:
         html = scraper.get("https://www.cv-library.co.uk/accounting-jobs-in-scotland").text
         soup = BeautifulSoup(html, "html.parser")
-        for job in soup.find_all("article", class_="job"):
-            title_elem = job.find("h2", class_="job__title")
-            if title_elem and title_elem.find("a"):
-                title = title_elem.text.strip()
-                link = "https://www.cv-library.co.uk" + title_elem.find("a")["href"]
-                company = job.find("a", class_="job__company")
-                company_name = company.text.strip() if company else "Unknown"
-                desc = job.find("p", class_="job__desc")
-                description = desc.text.strip() if desc else ""
-                jobs.append({"title": title, "company": company_name, "link": link, "description": description})
+        for title_elem in soup.find_all("h2"):
+            a_tag = title_elem.find("a")
+            if not a_tag:
+                continue
+            title = title_elem.text.strip()
+            link = "https://www.cv-library.co.uk" + a_tag["href"]
+            
+            # Find company
+            company_span = title_elem.parent.find("span", attrs={"data-qa": lambda x: x and x.startswith("job-card-company")})
+            company_name = company_span.text.strip() if company_span else "Unknown"
+            
+            # Find description by going up to the job card container
+            job_card = title_elem.find_parent("div", class_=lambda x: x and "JobCard_jobCardBody" in x)
+            desc_p = job_card.find("p", class_=lambda x: x and "JobCard_descText" in x) if job_card else None
+            description = desc_p.text.strip() if desc_p else ""
+            
+            jobs.append({"title": title, "company": company_name, "link": link, "description": description})
     except Exception as e:
         print(f"Error scraping: {e}")
     return jobs
