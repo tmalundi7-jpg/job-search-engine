@@ -88,7 +88,7 @@ async def evaluate_job(job):
     try:
         response = await client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama3-70b-8192",
+            model="llama-3.1-70b-versatile",
             temperature=0.1,
             response_format={"type": "json_object"}
         )
