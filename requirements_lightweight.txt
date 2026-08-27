@@ -1,4 +1,6 @@
+groq
 google-genai
-cloudscraper
+requests
 beautifulsoup4
+cloudscraper
 python-dotenv
