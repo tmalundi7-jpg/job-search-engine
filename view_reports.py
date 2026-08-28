@@ -1,3 +1,4 @@
+import antigravity
 import os
 
 REPORT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "job_matches_report.md")
