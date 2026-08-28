@@ -88,7 +88,16 @@ def setup_db():
                  (title TEXT, company TEXT, link TEXT UNIQUE, match_score INTEGER, explanation TEXT, active INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     c.execute("CREATE INDEX IF NOT EXISTS idx_match_score ON jobs(match_score)")
     
-    # Auto-cleanup old 0-score / failed records from legacy runs so they get freshly evaluated
+    # Auto-migrate: Check if created_at column exists in existing database
+    c.execute("PRAGMA table_info(jobs)")
+    columns = [col[1] for col in c.fetchall()]
+    if "created_at" not in columns:
+        try:
+            c.execute("ALTER TABLE jobs ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        except Exception:
+            pass
+            
+    # Auto-cleanup old 0-score / failed records from legacy runs
     c.execute("DELETE FROM jobs WHERE match_score <= 0")
     conn.commit()
     return conn
@@ -100,7 +109,6 @@ def scrape_jobs():
         'Accept-Language': 'en-GB,en;q=0.9',
     }
     
-    # Multi-stream targeting Scotland & Remote Accounting Roles
     pages = [
         "https://www.reed.co.uk/jobs/accounting-jobs-in-scotland",
         "https://www.reed.co.uk/jobs/management-accountant-jobs-in-scotland",
@@ -124,7 +132,6 @@ def scrape_jobs():
                 
             soup = BeautifulSoup(r.text, "html.parser")
             
-            # Try primary and fallback article selectors
             articles = soup.find_all("article")
             if not articles:
                 articles = soup.find_all("div", class_=lambda x: x and ("job-result" in x or "job-card" in x))
@@ -262,8 +269,7 @@ async def agent_worker(name, queue, db_conn):
                 existing = c.fetchone()
                 
             if existing:
-                queue.task_done()
-                continue
+                continue  # Skip to finally block which calls queue.task_done()
                 
             score, explanation = await evaluate_job(job)
             
@@ -295,8 +301,8 @@ async def agent_worker(name, queue, db_conn):
 
 def generate_report(conn):
     c = conn.cursor()
-    # Pull all jobs scoring 50+ (high matches)
-    c.execute("SELECT title, company, link, match_score, explanation, created_at FROM jobs WHERE match_score >= 50 ORDER BY match_score DESC, created_at DESC")
+    # Pull all jobs scoring 50+
+    c.execute("SELECT title, company, link, match_score, explanation FROM jobs WHERE match_score >= 50 ORDER BY match_score DESC")
     jobs = c.fetchall()
     
     with open(REPORT_PATH, "w", encoding='utf-8') as f:
@@ -312,7 +318,7 @@ def generate_report(conn):
                 f.write(f"- **Rationale:** {j[4]}\n")
                 f.write(f"- **Apply Link:** [{j[2]}]({j[2]})\n\n")
                 
-    print(f"\n[Report] Updated job match summary: {REPORT_PATH} ({len(jobs)} matches)", flush=True)
+    print(f"\n[Report] Generated job matches report: {REPORT_PATH} ({len(jobs)} matches)", flush=True)
 
 async def run_swarm_cycle():
     conn = setup_db()
