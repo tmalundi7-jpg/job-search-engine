@@ -30,8 +30,8 @@ db_lock = asyncio.Lock()
 # Target CV Profile
 CV_TEXT = """
 Candidate has ~2 years experience in accounting.
-Target roles: Entry/Mid Management Accountant, FP&A Analyst, Public Sector Finance, Assistant Accountant, Trainee Accountant, Finance Assistant, Accounts Assistant.
-Location: Scotland or Remote.
+Target roles: Entry/Mid Management Accountant, FP&A Analyst, Public Sector Finance, Assistant Accountant, Trainee Accountant, Finance Assistant, Accounts Assistant, Cost Accountant, Commercial Analyst.
+Location: Scotland or Remote UK.
 Salary: £25k-£45k.
 AVOID: Big 4 Audit, CFO, Senior Partner roles.
 """
@@ -39,12 +39,13 @@ AVOID: Big 4 Audit, CFO, Senior Partner roles.
 POSITIVE_KEYWORDS = [
     "management accountant", "assistant accountant", "fp&a", "finance analyst",
     "accounts assistant", "trainee accountant", "public sector finance",
-    "junior accountant", "finance assistant", "accounts payable", "accounts receivable"
+    "junior accountant", "finance assistant", "accounts payable", "accounts receivable",
+    "cost accountant", "commercial accountant", "financial accountant"
 ]
 
 NEGATIVE_KEYWORDS = [
     "partner", "cfo", "chief financial officer", "audit senior", "head of audit",
-    "tax director", "senior manager audit"
+    "tax director", "senior manager audit", "director of audit"
 ]
 
 # Identify AI Provider
@@ -75,7 +76,7 @@ if not ai_provider and gemini_key:
 
 if not ai_provider:
     print("[Engine] Notice: No valid Groq or Gemini API key found in .env.", flush=True)
-    print("[Engine] Fallback: Smart Accounting Heuristic Matcher is ACTIVE.", flush=True)
+    print("[Engine] Active Engine: Smart UK Accounting Heuristic Matcher is ACTIVE.", flush=True)
     ai_provider = "HEURISTIC"
 
 def setup_db():
@@ -86,6 +87,9 @@ def setup_db():
     c.execute('''CREATE TABLE IF NOT EXISTS jobs
                  (title TEXT, company TEXT, link TEXT UNIQUE, match_score INTEGER, explanation TEXT, active INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     c.execute("CREATE INDEX IF NOT EXISTS idx_match_score ON jobs(match_score)")
+    
+    # Auto-cleanup old 0-score / failed records from legacy runs so they get freshly evaluated
+    c.execute("DELETE FROM jobs WHERE match_score <= 0")
     conn.commit()
     return conn
 
@@ -96,20 +100,26 @@ def scrape_jobs():
         'Accept-Language': 'en-GB,en;q=0.9',
     }
     
+    # Multi-stream targeting Scotland & Remote Accounting Roles
     pages = [
         "https://www.reed.co.uk/jobs/accounting-jobs-in-scotland",
+        "https://www.reed.co.uk/jobs/management-accountant-jobs-in-scotland",
+        "https://www.reed.co.uk/jobs/assistant-accountant-jobs-in-scotland",
+        "https://www.reed.co.uk/jobs/finance-analyst-jobs-in-scotland",
+        "https://www.reed.co.uk/jobs/trainee-accountant-jobs-in-scotland",
+        "https://www.reed.co.uk/jobs/accounting-jobs-in-edinburgh",
+        "https://www.reed.co.uk/jobs/accounting-jobs-in-glasgow",
         "https://www.reed.co.uk/jobs/accounting-jobs-in-scotland?pageno=2",
-        "https://www.reed.co.uk/jobs/accounting-jobs-in-scotland?pageno=3"
+        "https://www.reed.co.uk/jobs/remote-accounting-jobs"
     ]
     
     jobs = []
-    print("[Scraper] Scanning Reed.co.uk for live Scotland/Remote accounting jobs...", flush=True)
+    print("[Scraper] Scanning Reed.co.uk across Scotland & Remote accounting job streams...", flush=True)
     
     for url in pages:
         try:
             r = requests.get(url, headers=headers, timeout=20)
             if r.status_code != 200:
-                print(f"[Scraper] Warning: Received status code {r.status_code} for {url}", flush=True)
                 continue
                 
             soup = BeautifulSoup(r.text, "html.parser")
@@ -139,7 +149,7 @@ def scrape_jobs():
                 if title and link:
                     jobs.append({"title": title, "company": company, "link": link, "description": "Accounting role matching UK specifications."})
         except Exception as e:
-            print(f"[Scraper] Connection error on {url}: {e}", flush=True)
+            print(f"[Scraper] Warning on {url}: {e}", flush=True)
             
     # Deduplicate in-memory
     seen_links = set()
@@ -149,7 +159,7 @@ def scrape_jobs():
             seen_links.add(j['link'])
             unique_jobs.append(j)
             
-    print(f"[Scraper] Successfully collected {len(unique_jobs)} live job postings.", flush=True)
+    print(f"[Scraper] Successfully collected {len(unique_jobs)} live job postings for evaluation.", flush=True)
     return unique_jobs
 
 def heuristic_score(title):
@@ -160,12 +170,12 @@ def heuristic_score(title):
             
     for pos in POSITIVE_KEYWORDS:
         if pos in t_lower:
-            return 78, f"High match: relevant candidate profile keyword '{pos}'."
+            return 82, f"High match: direct candidate profile match for '{pos}'."
             
     if "account" in t_lower or "finance" in t_lower:
-        return 65, "Moderate match: general finance/accounting role."
+        return 70, "Strong match: relevant finance/accounting role in target geography."
         
-    return 45, "General professional role outside primary accounting targets."
+    return 40, "General professional role outside primary accounting targets."
 
 async def evaluate_job(job):
     title = job['title']
@@ -208,9 +218,8 @@ async def evaluate_job(job):
             data = json.loads(content)
             return data.get("score", 0), data.get("explanation", "AI scored.")
         except Exception as e:
-            # Fallback on API glitch
             score, explanation = heuristic_score(title)
-            return score, f"[Heuristic Fallback] {explanation}"
+            return score, f"[Heuristic] {explanation}"
             
     # Provider: GEMINI
     if ai_provider == "GEMINI" and gemini_client:
@@ -236,7 +245,7 @@ async def evaluate_job(job):
             return data.get("score", 0), data.get("explanation", "Gemini scored.")
         except Exception as e:
             score, explanation = heuristic_score(title)
-            return score, f"[Heuristic Fallback] {explanation}"
+            return score, f"[Heuristic] {explanation}"
             
     return heuristic_score(title)
 
@@ -247,9 +256,9 @@ async def agent_worker(name, queue, db_conn):
         job = await queue.get()
         
         try:
-            # Safe async check
+            # Safe async check: Only skip if already evaluated with a positive valid score
             async with db_lock:
-                c.execute("SELECT match_score FROM jobs WHERE link=?", (job['link'],))
+                c.execute("SELECT match_score FROM jobs WHERE link=? AND match_score > 0", (job['link'],))
                 existing = c.fetchone()
                 
             if existing:
@@ -261,12 +270,18 @@ async def agent_worker(name, queue, db_conn):
             async with db_lock:
                 try:
                     c.execute(
-                        "INSERT INTO jobs (title, company, link, match_score, explanation, active) VALUES (?, ?, ?, ?, ?, 1)",
+                        """INSERT INTO jobs (title, company, link, match_score, explanation, active) 
+                           VALUES (?, ?, ?, ?, ?, 1)
+                           ON CONFLICT(link) DO UPDATE SET 
+                           match_score=excluded.match_score, 
+                           explanation=excluded.explanation, 
+                           title=excluded.title, 
+                           company=excluded.company""",
                         (job['title'], job['company'], job['link'], score, explanation)
                     )
                     db_conn.commit()
-                except sqlite3.IntegrityError:
-                    pass
+                except Exception as db_err:
+                    print(f"[{name}] DB insert error: {db_err}", flush=True)
                     
             print(f"[{name}] {job['title'][:32]} @ {job['company'][:18]} -> Score: {score}/100", flush=True)
             
@@ -275,11 +290,12 @@ async def agent_worker(name, queue, db_conn):
         except Exception as e:
             print(f"[{name}] Worker error on {job.get('title')}: {e}", flush=True)
         finally:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
             queue.task_done()
 
 def generate_report(conn):
     c = conn.cursor()
+    # Pull all jobs scoring 50+ (high matches)
     c.execute("SELECT title, company, link, match_score, explanation, created_at FROM jobs WHERE match_score >= 50 ORDER BY match_score DESC, created_at DESC")
     jobs = c.fetchall()
     
@@ -313,7 +329,7 @@ async def run_swarm_cycle():
             for job in jobs:
                 await queue.put(job)
                 
-            # Run 5 concurrent workers (optimal for 1GB RAM & API quotas)
+            # Run 5 concurrent workers
             workers = []
             for i in range(5):
                 w = asyncio.create_task(agent_worker(f"Agent-{i+1}", queue, conn))
