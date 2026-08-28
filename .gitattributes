@@ -1,0 +1,5 @@
+*.txt text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+requirements.txt text eol=lf
+requirements_lightweight.txt text eol=lf
