@@ -1,125 +1,249 @@
-import sqlite3
-import json
+"""
+Database abstraction layer supporting SQLite (default) and optional PostgreSQL.
+Implements schema migrations, connection pooling, and async operations.
+"""
+import asyncio
 import logging
-import os
-from datetime import datetime
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone, timedelta
+import config
+from models import ScoredJob
 
 logger = logging.getLogger(__name__)
 
-# Ensure data directory exists for Docker persistence
-os.makedirs("data", exist_ok=True)
-DB_NAME = "data/jobs_database.db"
+class Database:
+    def __init__(self):
+        self.backend = None
+        self.lock = asyncio.Lock()  # for SQLite write serialization
 
-def init_db():
-    """Initializes the SQLite database with the required schema."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Create jobs table
-    # Using 'link' as the UNIQUE constraint to prevent duplicate job entries
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            company TEXT,
-            location TEXT,
-            salary TEXT,
-            link TEXT UNIQUE,
-            source TEXT,
-            match_score INTEGER,
-            why_fits TEXT,
-            status TEXT DEFAULT 'ACTIVE',
-            date_found TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully.")
+    async def connect(self):
+        if config.DATABASE_URL:
+            import asyncpg
+            self.backend = "postgres"
+            self.pool = await asyncpg.create_pool(
+                config.DATABASE_URL,
+                min_size=1,
+                max_size=10,
+            )
+            await self._run_migrations_postgres()
+        else:
+            import aiosqlite
+            self.backend = "sqlite"
+            self.conn = await aiosqlite.connect(config.SQLITE_PATH)
+            self.conn.row_factory = aiosqlite.Row
+            await self.conn.execute("PRAGMA journal_mode=WAL")
+            await self.conn.execute("PRAGMA foreign_keys=ON")
+            await self._run_migrations_sqlite()
+        logger.info(f"Connected to {self.backend} database")
 
-def upsert_jobs(jobs_list):
-    """
-    Inserts a list of job dictionaries into the database.
-    If the link already exists, updates the match_score, why_fits, and last_checked.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    inserted = 0
-    updated = 0
-    
-    for job in jobs_list:
-        link = job.get('Application Link') or job.get('link')
-        if not link:
-            continue
-            
-        title = job.get('Job Title') or job.get('title', 'Unknown Title')
-        company = job.get('Company') or job.get('company', 'Unknown Company')
-        location = job.get('Location') or job.get('location', 'Unknown Location')
-        salary = str(job.get('Salary') or job.get('salary', 'Competitive'))
-        source = job.get('Source', 'AI Search')
-        
-        # Try to parse match score
-        try:
-            score = int(job.get('Match Score', 0))
-        except:
-            score = 0
-            
-        why_fits = job.get('Why Candidate Fits', '')
-        
-        try:
-            cursor.execute('''
-                INSERT INTO jobs (title, company, location, salary, link, source, match_score, why_fits, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
-            ''', (title, company, location, salary, link, source, score, why_fits))
-            inserted += 1
-        except sqlite3.IntegrityError:
-            # Job exists, update it
-            cursor.execute('''
-                UPDATE jobs 
-                SET match_score = ?, why_fits = ?, last_checked = CURRENT_TIMESTAMP, status = 'ACTIVE'
-                WHERE link = ?
-            ''', (score, why_fits, link))
-            updated += 1
-            
-    conn.commit()
-    conn.close()
-    logger.info(f"Database sync: {inserted} new jobs inserted, {updated} existing jobs updated.")
+    async def close(self):
+        if self.backend == "sqlite":
+            await self.conn.close()
+        elif self.backend == "postgres" and hasattr(self, 'pool'):
+            await self.pool.close()
 
-def generate_markdown_report(filepath="data/job_matches_report.md"):
-    """Reads the active jobs from the database and generates a markdown report."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Fetch top 50 active jobs, ordered by match score
-    cursor.execute('''
-        SELECT title, company, location, salary, link, match_score, why_fits, date_found 
-        FROM jobs 
-        WHERE status = 'ACTIVE' AND match_score >= 60
-        ORDER BY match_score DESC 
-        LIMIT 50
-    ''')
-    rows = cursor.fetchall()
-    conn.close()
-    
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(f"# 24/7 Engine: Validated Job Matches\n")
-        f.write(f"*Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
-        f.write(f"Total live, matched roles in database: **{len(rows)}** (Showing Top 50)\n\n")
-        f.write("---\n\n")
-        
-        if not rows:
-            f.write("> **No jobs found matching the strict criteria yet. The engine is still searching...**\n")
-            return
-            
+    async def _run_migrations_sqlite(self):
+        async with self.lock:
+            cursor = await self.conn.execute("PRAGMA user_version")
+            row = await cursor.fetchone()
+            current_version = row[0] if row else 0
+            target_version = config.DB_USER_VERSION
+
+            if current_version < 1:
+                await self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS jobs (
+                        title TEXT,
+                        company TEXT,
+                        link TEXT UNIQUE,
+                        match_score INTEGER,
+                        explanation TEXT,
+                        active INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_match_score ON jobs(match_score)")
+                await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON jobs(created_at)")
+                current_version = 1
+                await self.conn.execute(f"PRAGMA user_version = {current_version}")
+
+            if current_version < 2:
+                await self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS feedback (
+                        job_url TEXT PRIMARY KEY,
+                        feedback TEXT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                current_version = 2
+                await self.conn.execute(f"PRAGMA user_version = {current_version}")
+
+            if current_version < 3:
+                # Add notified column if it doesn't exist
+                cursor = await self.conn.execute("PRAGMA table_info(jobs)")
+                cols = [c[1] for c in await cursor.fetchall()]
+                if "notified" not in cols:
+                    try:
+                        await self.conn.execute("ALTER TABLE jobs ADD COLUMN notified INTEGER DEFAULT 0")
+                    except Exception as e:
+                        logger.warning(f"Could not add notified column: {e}")
+                current_version = 3
+                await self.conn.execute(f"PRAGMA user_version = {current_version}")
+
+            await self.conn.commit()
+
+    async def _run_migrations_postgres(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    title TEXT,
+                    company TEXT,
+                    link TEXT UNIQUE,
+                    match_score INTEGER,
+                    explanation TEXT,
+                    active INTEGER,
+                    notified INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_match_score ON jobs(match_score)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON jobs(created_at)")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS feedback (
+                    job_url TEXT PRIMARY KEY,
+                    feedback TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+    async def get_recent_score(self, link: str, ttl_hours: int) -> Optional[Dict[str, Any]]:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+        if self.backend == "sqlite":
+            async with self.lock:
+                cursor = await self.conn.execute(
+                    "SELECT title, company, link, match_score, explanation, active, notified, created_at FROM jobs WHERE link = ? AND created_at > ?",
+                    (link, cutoff.isoformat())
+                )
+                row = await cursor.fetchone()
+        else:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT title, company, link, match_score, explanation, active, notified, created_at FROM jobs WHERE link = $1 AND created_at > $2",
+                    link, cutoff
+                )
+        if row:
+            result = dict(row)
+            if isinstance(result.get("created_at"), str):
+                try:
+                    result["created_at"] = datetime.fromisoformat(result["created_at"])
+                except Exception:
+                    pass
+            return result
+        return None
+
+    async def upsert_job(self, job: ScoredJob):
+        created_at_val = job.created_at.isoformat() if isinstance(job.created_at, datetime) else str(job.created_at)
+        if self.backend == "sqlite":
+            async with self.lock:
+                await self.conn.execute(
+                    """
+                    INSERT INTO jobs (title, company, link, match_score, explanation, active, notified, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(link) DO UPDATE SET
+                        match_score = excluded.match_score,
+                        explanation = excluded.explanation,
+                        active = excluded.active,
+                        notified = excluded.notified
+                    """,
+                    (job.title, job.company, job.link, job.match_score, job.explanation, job.active, job.notified, created_at_val)
+                )
+                await self.conn.commit()
+        else:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO jobs (title, company, link, match_score, explanation, active, notified, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (link) DO UPDATE SET
+                        match_score = EXCLUDED.match_score,
+                        explanation = EXCLUDED.explanation,
+                        active = EXCLUDED.active,
+                        notified = EXCLUDED.notified
+                    """,
+                    job.title, job.company, job.link, job.match_score, job.explanation, job.active, job.notified, job.created_at
+                )
+
+    async def get_all_matching_jobs(self, threshold: int = config.MATCH_THRESHOLD) -> List[ScoredJob]:
+        if self.backend == "sqlite":
+            async with self.lock:
+                cursor = await self.conn.execute(
+                    "SELECT * FROM jobs WHERE match_score >= ? ORDER BY match_score DESC, created_at DESC",
+                    (threshold,)
+                )
+                rows = await cursor.fetchall()
+        else:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM jobs WHERE match_score >= $1 ORDER BY match_score DESC, created_at DESC",
+                    threshold
+                )
+        jobs = []
         for row in rows:
-            title, company, location, salary, link, score, why_fits, date_found = row
-            f.write(f"### {title} @ {company} (Score: {score}/100)\n")
-            f.write(f"- **Location:** {location}\n")
-            f.write(f"- **Salary:** {salary}\n")
-            f.write(f"- **Why it fits:** {why_fits}\n")
-            f.write(f"- **Date Found:** {date_found}\n")
-            f.write(f"- **Application Link:** [Apply Here]({link})\n\n")
-            
-    logger.info(f"Markdown report generated with {len(rows)} jobs.")
+            created_at = row["created_at"]
+            if isinstance(created_at, str):
+                try:
+                    created_at = datetime.fromisoformat(created_at)
+                except Exception:
+                    created_at = datetime.now(timezone.utc)
+            jobs.append(ScoredJob(
+                title=row["title"],
+                company=row["company"],
+                link=row["link"],
+                match_score=row["match_score"],
+                explanation=row["explanation"],
+                active=row["active"],
+                notified=row["notified"],
+                created_at=created_at
+            ))
+        return jobs
+
+    async def add_feedback(self, job_url: str, feedback: str):
+        if self.backend == "sqlite":
+            async with self.lock:
+                await self.conn.execute(
+                    "INSERT OR REPLACE INTO feedback (job_url, feedback) VALUES (?, ?)",
+                    (job_url, feedback)
+                )
+                await self.conn.commit()
+        else:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO feedback (job_url, feedback) VALUES ($1, $2) ON CONFLICT (job_url) DO UPDATE SET feedback = $2",
+                    job_url, feedback
+                )
+
+    async def get_feedback(self, job_url: str) -> Optional[str]:
+        if self.backend == "sqlite":
+            async with self.lock:
+                cursor = await self.conn.execute(
+                    "SELECT feedback FROM feedback WHERE job_url = ?", (job_url,)
+                )
+                row = await cursor.fetchone()
+        else:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT feedback FROM feedback WHERE job_url = $1", job_url
+                )
+        return row["feedback"] if row else None
+
+    async def mark_as_notified(self, link: str):
+        if self.backend == "sqlite":
+            async with self.lock:
+                await self.conn.execute(
+                    "UPDATE jobs SET notified = 1 WHERE link = ?", (link,)
+                )
+                await self.conn.commit()
+        else:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET notified = 1 WHERE link = $1", link
+                )
